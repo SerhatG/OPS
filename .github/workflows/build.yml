@@ -1,0 +1,187 @@
+name: Build
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: # Allows you to manually trigger the build from the Actions tab
+
+jobs:
+  build-linux:
+    name: Build linux-${{ matrix.arch}}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Install dependencies and configure CMake
+      run: |
+        cat << 'EOF' > build_actions.sh
+        #!/bin/sh
+        set -e
+
+        # Install dependencies
+        apk add --no-cache build-base cmake gfortran file
+
+        # Go to source directory
+        cd ops_lt
+
+        BUILD_DIR_PREFIX="build-linux-${MATRIX_ARCH}"
+        mkdir -v "${BUILD_DIR_PREFIX}"-single "${BUILD_DIR_PREFIX}"-multi
+
+        echo
+        echo ### Generating build directories'
+        echo
+        # Single core build
+        cd "${BUILD_DIR_PREFIX}"-single
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_Fortran_COMPILER=gfortran \
+          -DSKIP_OPENMP=true \
+          -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-static"
+        cd -
+
+        cd "${BUILD_DIR_PREFIX}"-multi
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_Fortran_COMPILER=gfortran \
+          -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-static" \
+          -DOpenMP_gomp_LIBRARY="$(gcc -print-file-name=libgomp.a)"
+        cd -
+
+        echo
+        echo '### Doing actual builds'
+        echo
+        mkdir target
+        for BUILD_DIR in build-*; do
+          cd "${BUILD_DIR}"
+          # Build using all available CPU cores
+          cmake --build . -j $(nproc 2>/dev/null)
+
+          # Validate dependencies if any
+          file bin/ops_lt_main_RELEASE_GNU
+
+          # Rename to better fit naming standards
+          mv bin/ops_lt_main_RELEASE_GNU ../target/ops-"${BUILD_DIR#build-}"
+
+          cd -
+        done
+        EOF
+
+        chmod +x build_actions.sh
+        docker run --rm \
+          -e MATRIX_ARCH="${{ matrix.arch}}" \
+          -v ${{ github.workspace }}:/workspace \
+          -w /workspace \
+          alpine:latest ./build_actions.sh
+
+    - name: Upload Build Artifact Single-core
+      uses: actions/upload-artifact@v7
+      with:
+        name: ops-linux-${{ matrix.arch }}-single
+        path: ops_lt/target/ops-linux-${{ matrix.arch }}-single
+        archive: false
+        if-no-files-found: error
+
+    - name: Upload Build Artifact Multi-core
+      uses: actions/upload-artifact@v7
+      with:
+        name: ops-linux-${{ matrix.arch }}-multi
+        path: ops_lt/target/ops-linux-${{ matrix.arch }}-multi
+        archive: false
+        if-no-files-found: error
+
+  build-macos:
+    name: Build macos-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-latest
+
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Prepare
+      run: |
+        # Install dependencies
+        brew update
+        brew install gcc cmake
+
+        # Force Static OpenMP (apple specific hack)
+        # We find exactly where Homebrew's gfortran keeps the OpenMP dynamic 
+        # library and rename it. This forces the linker to use the static libgomp.a.
+        GOMP_DYLIB=$(gfortran -print-file-name=libgomp.dylib)
+        if [[ "$GOMP_DYLIB" == /* ]]; then
+          echo "# Hiding $GOMP_DYLIB to force static linking..."
+          sudo mv "$GOMP_DYLIB" "${GOMP_DYLIB}.hidden"
+        fi
+
+    - name: Configure CMake
+      working-directory: ops_lt
+      run: |
+        BUILD_DIR_PREFIX=build-macos-${{ matrix.arch }}
+        mkdir "${BUILD_DIR_PREFIX}"-{single,multi}
+
+        # Single core build
+        pushd "${BUILD_DIR_PREFIX}"-single
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_Fortran_COMPILER=gfortran \
+          -DSKIP_OPENMP=true \
+          -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-static-libgcc -static-libgfortran -static-libquadmath"
+        popd
+
+        pushd "${BUILD_DIR_PREFIX}"-multi
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_Fortran_COMPILER=gfortran \
+          -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-static-libgcc -static-libgfortran -static-libquadmath"
+        popd
+        
+    - name: Build OPS
+      working-directory: ops_lt
+      run: |
+        mkdir target
+        for BUILD_DIR in build-*; do
+          pushd "${BUILD_DIR}"
+          # Build using all available CPU cores
+          cmake --build . -j $(sysctl -n hw.ncpu)
+
+          # Validate dependencies if any
+          otool -L bin/ops_lt_main_RELEASE_GNU
+
+          # Rename to better fit naming standards
+          mv bin/ops_lt_main_RELEASE_GNU ../target/ops-"${BUILD_DIR#build-}"
+
+          popd
+        done
+
+    - name: Upload Build Artifact Single-core
+      uses: actions/upload-artifact@v7
+      with:
+        name: ops-macos-${{ matrix.arch }}-single
+        path: ops_lt/target/ops-macos-${{ matrix.arch }}-single
+        archive: false
+        if-no-files-found: error
+
+    - name: Upload Build Artifact Multi-core
+      uses: actions/upload-artifact@v7
+      with:
+        name: ops-macos-${{ matrix.arch }}-multi
+        path: ops_lt/target/ops-macos-${{ matrix.arch }}-multi
+        archive: false
+        if-no-files-found: error
